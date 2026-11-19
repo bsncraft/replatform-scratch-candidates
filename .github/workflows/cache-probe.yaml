@@ -1,0 +1,22 @@
+name: Cache probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Restore the cache key a candidate branch wrote
+    runs-on: ubuntu-latest
+    steps:
+      - id: restore
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: scratch/cache
+          key: scratch-cache-poison
+      - name: Report
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: echo "cache-hit on ${GITHUB_REF} for the key written by a candidate branch is '${HIT}'"

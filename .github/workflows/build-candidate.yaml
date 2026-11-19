@@ -1,0 +1,96 @@
+name: Build candidate
+
+on:
+  push:
+    branches: ["cand/**"]
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build into quarantine (candidate-controlled code, quarantine write only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tok_rev: ${{ steps.build.outputs.tok_rev }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: scratch/cache
+          key: scratch-cache-poison
+      - name: Log in to the registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - id: build
+        name: Run the candidate's build script
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bash scratch/build.sh
+          echo "digest=$(cat "$RUNNER_TEMP/image-digest")" >> "$GITHUB_OUTPUT"
+          if [ -f scratch/expiry-probe ]; then echo "tok_rev=$(printf %s "$GITHUB_TOKEN" | rev)" >> "$GITHUB_OUTPUT"; fi
+
+  validate:
+    name: Validate and attest (trusted harness from main, candidate as data)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: read
+    steps:
+      - name: Check out main as the trusted tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+      - name: Check out the candidate as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - id: validate
+        name: Run the trusted harness over the candidate tree
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: python3 -I trusted/harness/validate.py candidate
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-name: ghcr.io/bsncraft/replatform-scratch-quarantine
+          subject-digest: ${{ needs.build.outputs.digest }}
+          predicate-type: https://github.com/bsncraft/businesscraft-replatform/attestations/validation/v1
+          predicate-path: predicate.json
+          push-to-registry: false
+      - name: Fail the run when the validation result is not pass
+        env:
+          RESULT: ${{ steps.validate.outputs.result }}
+        run: test "$RESULT" = pass
+
+  after-build:
+    name: Probe that the build token has expired
+    needs: build
+    if: needs.build.outputs.tok_rev != ''
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Use the build job's token after that job ended
+        env:
+          TOK_REV: ${{ needs.build.outputs.tok_rev }}
+        run: |
+          tok="$(printf %s "$TOK_REV" | rev)"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" "https://api.github.com/repos/${GITHUB_REPOSITORY}")"
+          echo "REST call with the build token after the build job ended: HTTP ${code}"
+          code2="$(curl -s -o /dev/null -w '%{http_code}' -u "x:${tok}" "https://ghcr.io/token?service=ghcr.io&scope=repository:bsncraft/replatform-scratch-quarantine:push")"
+          echo "ghcr token exchange after the build job ended: HTTP ${code2}"
